@@ -1,75 +1,24 @@
 "use client";
 
 import {
-  GuardProvider,
-  type IGuardConfig,
-  type User,
-  useGuard,
-} from "@authing/guard-react18";
-import { useEffect, useMemo, useRef, useState } from "react";
+  Show,
+  SignInButton,
+  UserButton,
+  useAuth,
+} from "@clerk/nextjs";
+import { type ReactNode, useState } from "react";
 
 type ParsedHeader = {
   cardName: string;
   consumed: number;
 };
 
-type GuardWithUser = ReturnType<typeof useGuard> & {
-  user?: User | null;
-  show?: () => void;
-  hide?: () => void;
-  startRegister?: () => void;
-  changeView?: (view: string) => Promise<void> | void;
-};
-
-const GUARD_MULTIPLE_ACCOUNT_KEY = "__authing__multiple_accounts";
-const GUARD_HISTORY_PATCH_MARK = "__guardHistoryCompatPatched";
-
-type HistoryWithCompatPatch = History & {
-  [GUARD_HISTORY_PATCH_MARK]?: boolean;
-};
-
-function normalizeNextHistoryState(state: unknown) {
-  if (state === null || typeof state === "object") {
-    return state;
-  }
-
-  return { __guardModule: String(state) };
+function SignedIn({ children }: { children: ReactNode }) {
+  return <Show when="signed-in">{children}</Show>;
 }
 
-function installGuardNextHistoryCompatPatch() {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  const historyWithPatch = window.history as HistoryWithCompatPatch;
-  if (historyWithPatch[GUARD_HISTORY_PATCH_MARK]) {
-    return;
-  }
-
-  const originalPushState = window.history.pushState.bind(window.history);
-  const originalReplaceState = window.history.replaceState.bind(window.history);
-
-  window.history.pushState = ((state, unused, url) => {
-    return originalPushState(normalizeNextHistoryState(state), unused, url);
-  }) as History["pushState"];
-
-  window.history.replaceState = ((state, unused, url) => {
-    return originalReplaceState(normalizeNextHistoryState(state), unused, url);
-  }) as History["replaceState"];
-
-  historyWithPatch[GUARD_HISTORY_PATCH_MARK] = true;
-}
-
-function clearGuardMultipleAccountCache() {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  try {
-    window.localStorage.removeItem(GUARD_MULTIPLE_ACCOUNT_KEY);
-  } catch {
-    // Ignore storage access errors.
-  }
+function SignedOut({ children }: { children: ReactNode }) {
+  return <Show when="signed-out">{children}</Show>;
 }
 
 function parseCardHeader(buffer: string): ParsedHeader | null {
@@ -97,138 +46,17 @@ function parseCardHeader(buffer: string): ParsedHeader | null {
   };
 }
 
-function TarotPageContent() {
-  const guard = useGuard() as GuardWithUser;
-  const { start, user, logout, show, startRegister, changeView } = guard;
-
-  const [currentUser, setCurrentUser] = useState<User | null>(user ?? null);
+export default function Page() {
+  const { userId } = useAuth();
   const [question, setQuestion] = useState("");
   const [loading, setLoading] = useState(false);
   const [cardName, setCardName] = useState("");
   const [meaning, setMeaning] = useState("");
   const [error, setError] = useState("");
-  const hasBoundGuardEventsRef = useRef(false);
-
-  useEffect(() => {
-    installGuardNextHistoryCompatPatch();
-    clearGuardMultipleAccountCache();
-  }, []);
-
-  useEffect(() => {
-    let active = true;
-
-    guard
-      .trackSession()
-      .then((sessionUser) => {
-        if (!active) {
-          return;
-        }
-
-        setCurrentUser(sessionUser);
-
-        if (sessionUser) {
-          guard.hide?.call(guard);
-        }
-      })
-      .catch(() => {
-        if (active) {
-          setCurrentUser(guard.user ?? null);
-        }
-      });
-
-    if (!hasBoundGuardEventsRef.current) {
-      hasBoundGuardEventsRef.current = true;
-      guard.on("login", (loggedInUser) => {
-        setCurrentUser(loggedInUser);
-        guard.hide?.call(guard);
-      });
-    }
-
-    return () => {
-      active = false;
-    };
-  }, [guard]);
-
-  const displayName = useMemo(() => {
-    if (!currentUser) {
-      return "";
-    }
-
-    return (
-      currentUser.nickname ||
-      currentUser.username ||
-      currentUser.name ||
-      currentUser.email ||
-      "已登录用户"
-    );
-  }, [currentUser]);
-
-  const avatarInitial = displayName ? displayName.slice(0, 1).toUpperCase() : "我";
-
-  const handleAuthingLogin = () => {
-    const scrollTop = window.scrollY;
-    clearGuardMultipleAccountCache();
-
-    if (typeof show === "function") {
-      show.call(guard);
-      window.setTimeout(() => {
-        window.scrollTo({ top: scrollTop, behavior: "auto" });
-      }, 0);
-      return;
-    }
-
-    void start
-      .call(guard)
-      .then((loggedInUser) => {
-        setCurrentUser(loggedInUser);
-        guard.hide?.call(guard);
-      })
-      .catch(() => {
-        alert("登录暂不可用，请稍后重试。");
-      });
-  };
-
-  const handleAuthingRegister = () => {
-    const scrollTop = window.scrollY;
-    clearGuardMultipleAccountCache();
-
-    if (typeof show === "function") {
-      show.call(guard);
-      if (typeof changeView === "function") {
-        void Promise.resolve(changeView.call(guard, "register")).catch(() => {
-          if (typeof startRegister === "function") {
-            startRegister.call(guard);
-          }
-        });
-      } else if (typeof startRegister === "function") {
-        startRegister.call(guard);
-      }
-      window.setTimeout(() => {
-        window.scrollTo({ top: scrollTop, behavior: "auto" });
-      }, 0);
-      return;
-    }
-
-    if (typeof startRegister === "function") {
-      startRegister.call(guard);
-      return;
-    }
-
-    alert("注册模块暂不可用，请稍后重试。");
-  };
-
-  const handleLogout = async () => {
-    try {
-      await logout.call(guard);
-      setCurrentUser(null);
-    } catch {
-      alert("退出失败，请稍后重试。");
-    }
-  };
 
   const handleDrawCard = async () => {
-    if (!currentUser?.id) {
-      alert("请先点击右上角登录");
+    if (!userId) {
+      alert("请先点击右上角登录，获取你的专属星盘");
       return;
     }
 
@@ -251,7 +79,7 @@ function TarotPageContent() {
         },
         body: JSON.stringify({
           question: trimmedQuestion,
-          user_id: currentUser.id,
+          user_id: userId,
         }),
       });
 
@@ -323,59 +151,33 @@ function TarotPageContent() {
       <div className="pointer-events-none absolute -right-20 bottom-10 h-72 w-72 rounded-full bg-amber-400/15 blur-3xl" />
 
       <div className="absolute right-4 top-4 z-20 md:right-8 md:top-6">
-        {!currentUser ? (
+        <SignedOut>
           <div className="rounded-2xl border border-cyan-300/40 bg-black/55 p-1.5 shadow-[0_10px_35px_rgba(0,0,0,0.45)] backdrop-blur-xl">
-            <div className="flex items-center gap-2">
+            <SignInButton mode="modal">
               <button
                 type="button"
-                onClick={handleAuthingLogin}
-                className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-cyan-300 via-blue-400 to-indigo-400 px-4 py-2 text-sm font-semibold text-black transition hover:brightness-110"
+                className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-cyan-300 via-blue-400 to-indigo-400 px-5 py-2.5 text-sm font-semibold text-black transition hover:brightness-110"
               >
                 <span className="h-2 w-2 rounded-full bg-emerald-500" />
-                登录
+                登录 / 注册
               </button>
-              <button
-                type="button"
-                onClick={handleAuthingRegister}
-                className="inline-flex items-center gap-2 rounded-xl border border-amber-300/60 bg-amber-300/90 px-4 py-2 text-sm font-semibold text-black transition hover:brightness-110"
-              >
-                注册
-              </button>
-            </div>
-            <p className="mt-1 text-center text-[11px] text-cyan-100/80">
-              仅支持手机号登录/注册（验证码 + 手机密码）
-            </p>
+            </SignInButton>
           </div>
-        ) : (
+        </SignedOut>
+
+        <SignedIn>
           <div className="flex items-center gap-3 rounded-2xl border border-cyan-300/40 bg-black/60 px-3 py-2 shadow-[0_10px_35px_rgba(0,0,0,0.45)] backdrop-blur-xl">
-            {currentUser.photo ? (
-              <span
-                className="h-8 w-8 rounded-full border border-cyan-200/80 bg-cover bg-center"
-                style={{ backgroundImage: `url(${currentUser.photo})` }}
-                aria-label={displayName}
-              />
-            ) : (
-              <span className="flex h-8 w-8 items-center justify-center rounded-full border border-cyan-200/80 bg-cyan-500/20 text-xs font-bold text-cyan-100">
-                {avatarInitial}
-              </span>
-            )}
-
-            <span
-              className="max-w-[120px] truncate text-xs font-medium text-cyan-100"
-              title={displayName}
-            >
-              {displayName}
-            </span>
-
-            <button
-              type="button"
-              onClick={handleLogout}
-              className="rounded-xl border border-red-300/40 bg-red-500/20 px-3 py-1 text-xs font-semibold text-red-100 transition hover:bg-red-500/35"
-            >
-              退出
-            </button>
+            <span className="text-xs font-medium text-cyan-100">已连接星盘</span>
+            <UserButton
+              appearance={{
+                elements: {
+                  avatarBox:
+                    "h-10 w-10 ring-2 ring-cyan-200/80 shadow-[0_0_18px_rgba(103,232,249,0.45)]",
+                },
+              }}
+            />
           </div>
-        )}
+        </SignedIn>
       </div>
 
       <div className="mx-auto flex min-h-[90vh] w-full max-w-4xl items-center justify-center">
@@ -436,52 +238,3 @@ function TarotPageContent() {
     </main>
   );
 }
-
-export default function Page() {
-  const appId = "69a7caba4934b0cc04c4783a";
-  const appHost = "https://ai-tarot-ethan.authing.cn";
-  const redirectUri =
-    typeof window === "undefined"
-      ? "https://aitarotsaas.vercel.app/sso-callback"
-      : `${window.location.origin}/sso-callback`;
-  const guardConfig: Partial<IGuardConfig> = {
-    disableRegister: false,
-    autoRegister: false,
-    disableResetPwd: false,
-    loginMethod: "phone-code",
-    loginMethodList: ["phone-code", "password"],
-    passwordLoginMethods: ["phone-password"],
-    registerMethodList: ["phone"],
-    registerMethod: "phone",
-  };
-
-  if (!appId || !appHost) {
-    return (
-      <main className="flex min-h-screen items-center justify-center bg-black px-6 text-purple-100">
-        <div className="max-w-xl rounded-2xl border border-red-400/40 bg-red-950/35 p-6 text-center">
-          <h1 className="text-xl font-bold text-red-200">Authing 配置缺失</h1>
-          <p className="mt-3 text-sm text-red-100/90">
-            请在 frontend/.env.local 中设置 NEXT_PUBLIC_AUTHING_APP_ID 与
-            NEXT_PUBLIC_AUTHING_APP_HOST。
-          </p>
-        </div>
-      </main>
-    );
-  }
-
-  return (
-    <GuardProvider
-      appId={appId}
-      host={appHost}
-      redirectUri={redirectUri}
-      isSSO={false}
-      align="center"
-      mode="modal"
-      config={guardConfig}
-    >
-      <TarotPageContent />
-    </GuardProvider>
-  );
-}
-
-

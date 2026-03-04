@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -40,8 +41,44 @@ SYSTEM_PROMPT = (
     "第一行：CARD: [卡牌名称]"
     "第二行：留空"
     "第三行开始：详细占卜解读（不少于150字）。"
+    "解读必须自然完整收尾，最后一句必须是完整句，并以句号、问号或感叹号结束。"
     "不要输出JSON，不要输出Markdown标题，不要输出额外前缀。"
 )
+
+SENTENCE_ENDINGS = ("。", "！", "？", ".", "!", "?", "”", "」", "』", "）", ")")
+
+
+def extract_delta_text(delta_content: Any) -> str:
+    if isinstance(delta_content, str):
+        return delta_content
+
+    if isinstance(delta_content, list):
+        segments: list[str] = []
+        for item in delta_content:
+            if isinstance(item, str):
+                segments.append(item)
+                continue
+
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    segments.append(text)
+                continue
+
+            text = getattr(item, "text", None)
+            if isinstance(text, str):
+                segments.append(text)
+
+        return "".join(segments)
+
+    return ""
+
+
+def looks_incomplete(text: str) -> bool:
+    cleaned = text.rstrip()
+    if not cleaned:
+        return False
+    return not cleaned.endswith(SENTENCE_ENDINGS)
 
 app = FastAPI(title="AI Tarot Backend")
 
@@ -161,7 +198,7 @@ def draw_card(payload: DrawCardRequest):
         stream = client.chat.completions.create(
             model=ALIYUN_MODEL,
             stream=True,
-            max_tokens=1200,
+            max_tokens=1800,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": question},
@@ -171,13 +208,33 @@ def draw_card(payload: DrawCardRequest):
         raise HTTPException(status_code=502, detail=f"调用大模型失败: {exc}") from exc
 
     def iter_stream():
+        merged_chunks: list[str] = []
+        finish_reason: str | None = None
+
         try:
             for chunk in stream:
                 if not chunk.choices:
                     continue
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    yield delta
+
+                choice = chunk.choices[0]
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+
+                delta_text = extract_delta_text(choice.delta.content)
+                if not delta_text:
+                    continue
+
+                merged_chunks.append(delta_text)
+                yield delta_text
+
+            final_text = "".join(merged_chunks).replace("\uFEFF", "").strip()
+            if not final_text:
+                return
+
+            if finish_reason == "length":
+                yield "\n\n（命运信号尚未完全展开：本次回复达到模型输出上限。可再次抽牌继续接收后续指引。）"
+            elif looks_incomplete(final_text):
+                yield "。"
         except Exception as exc:
             yield f"\n\n[系统提示] 流式传输中断：{exc}"
 

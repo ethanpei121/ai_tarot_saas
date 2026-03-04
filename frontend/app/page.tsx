@@ -6,12 +6,15 @@ import {
   UserButton,
   useAuth,
 } from "@clerk/nextjs";
+import PaymentModal from "@/components/PaymentModal";
 import { type ReactNode, useState } from "react";
 
 type ParsedHeader = {
   cardName: string;
   consumed: number;
 };
+
+const QUOTA_EXHAUSTED_HINT = "【命运的馈赠已达上限】";
 
 function SignedIn({ children }: { children: ReactNode }) {
   return <Show when="signed-in">{children}</Show>;
@@ -53,6 +56,7 @@ export default function Page() {
   const [cardName, setCardName] = useState("");
   const [meaning, setMeaning] = useState("");
   const [error, setError] = useState("");
+  const [showPaymentModal, setShowPaymentModal] = useState(false);
 
   const handleDrawCard = async () => {
     if (!userId) {
@@ -70,6 +74,7 @@ export default function Page() {
     setError("");
     setCardName("");
     setMeaning("");
+    setShowPaymentModal(false);
 
     try {
       const response = await fetch("https://ai-tarot-saas.onrender.com/draw_card", {
@@ -82,6 +87,13 @@ export default function Page() {
           user_id: userId,
         }),
       });
+
+      if (response.status === 403) {
+        setShowPaymentModal(true);
+        const rejectText = (await response.text()).trim();
+        setError(rejectText || "当前额度不足，请完成支付后继续占卜。");
+        return;
+      }
 
       if (!response.ok) {
         throw new Error(`Request failed: ${response.status}`);
@@ -96,8 +108,14 @@ export default function Page() {
 
       let buffer = "";
       let cardParsed = false;
+      let quotaModalTriggered = false;
 
       const processBuffer = () => {
+        if (!quotaModalTriggered && buffer.includes(QUOTA_EXHAUSTED_HINT)) {
+          quotaModalTriggered = true;
+          setShowPaymentModal(true);
+        }
+
         if (!cardParsed) {
           const parsedHeader = parseCardHeader(buffer);
           if (!parsedHeader) {
@@ -235,6 +253,11 @@ export default function Page() {
           )}
         </section>
       </div>
+
+      <PaymentModal
+        isOpen={showPaymentModal}
+        onClose={() => setShowPaymentModal(false)}
+      />
     </main>
   );
 }

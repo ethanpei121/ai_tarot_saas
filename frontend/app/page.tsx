@@ -433,8 +433,8 @@ function TarotPageContent() {
 }
 
 export default function Page() {
-  const appId = "69a6a02c5f9b66358faf96ec";
-  const appHost = "https://ihmjkdy7jcdy-demo.authing.cn";
+  const appId = "69a7caba4934b0cc04c4783a";
+  const appHost = "https://ai-tarot-ethan.authing.cn";
   const guardConfig = {
     disableRegister: false,
     autoRegister: false,

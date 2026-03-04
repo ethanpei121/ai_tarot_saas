@@ -1,6 +1,11 @@
 "use client";
 
-import { GuardProvider, type User, useGuard } from "@authing/guard-react18";
+import {
+  GuardProvider,
+  type IGuardConfig,
+  type User,
+  useGuard,
+} from "@authing/guard-react18";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 type ParsedHeader = {
@@ -435,19 +440,18 @@ function TarotPageContent() {
 export default function Page() {
   const appId = "69a7caba4934b0cc04c4783a";
   const appHost = "https://ai-tarot-ethan.authing.cn";
-  const guardConfig = {
+  const redirectUri =
+    typeof window === "undefined"
+      ? "https://aitarotsaas.vercel.app/sso-callback"
+      : `${window.location.origin}/sso-callback`;
+  const guardConfig: Partial<IGuardConfig> = {
     disableRegister: false,
     autoRegister: false,
     disableResetPwd: false,
-    // Keep both naming styles for Guard config compatibility.
-    loginMethods: ["phone-code", "password"],
-    loginMethodList: ["phone-code", "password"],
-    defaultLoginMethod: "phone-code",
     loginMethod: "phone-code",
+    loginMethodList: ["phone-code", "password"],
     passwordLoginMethods: ["phone-password"],
-    registerMethods: ["phone"],
     registerMethodList: ["phone"],
-    defaultRegisterMethod: "phone",
     registerMethod: "phone",
   };
 
@@ -469,6 +473,8 @@ export default function Page() {
     <GuardProvider
       appId={appId}
       host={appHost}
+      redirectUri={redirectUri}
+      isSSO={false}
       align="center"
       mode="modal"
       config={guardConfig}

@@ -433,8 +433,8 @@ function TarotPageContent() {
 }
 
 export default function Page() {
-  const appId = process.env.NEXT_PUBLIC_AUTHING_APP_ID;
-  const appHost = process.env.NEXT_PUBLIC_AUTHING_APP_HOST;
+  const appId = "69a6a02c5f9b66358faf96ec";
+  const appHost = "https://ihmjkdy7jcdy-demo.authing.cn";
   const guardConfig = {
     disableRegister: false,
     autoRegister: false,

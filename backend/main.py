@@ -51,6 +51,15 @@ CONTINUATION_SYSTEM_PROMPT = (
     "请只输出新增的续写内容，不要重复已生成内容，不要重写 CARD 行。"
     "续写至少100字，并自然完整收尾。"
 )
+REPAIR_SYSTEM_PROMPT = (
+    "你是一个严谨的塔罗编辑器。你会收到一段可能不完整、语义断裂或格式错误的占卜草稿。"
+    "请将其修复为完整、连贯、自然收尾的最终版本。"
+    "输出必须严格使用以下纯文本格式："
+    "第一行：CARD: [卡牌名称]"
+    "第二行：留空"
+    "第三行开始：完整解读（不少于150字，末尾必须完整句号/问号/感叹号收尾）。"
+    "不要输出JSON，不要输出Markdown，不要解释过程。"
+)
 
 SENTENCE_ENDINGS = ("。", "！", "？", ".", "!", "?", "”", "」", "』", "）", ")")
 CARD_HEADER_PATTERN = re.compile(
@@ -58,7 +67,9 @@ CARD_HEADER_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 MIN_MEANING_CHARS = 150
-MAX_CONTINUATION_ROUNDS = 2
+MAX_GENERATION_ATTEMPTS = 3
+GENERATION_MAX_TOKENS = 2200
+STREAM_CHUNK_CHARS = 18
 
 
 def extract_text(content: Any) -> str:
@@ -122,45 +133,82 @@ def is_meaning_complete(text: str) -> bool:
     return meaning_char_count(text) >= MIN_MEANING_CHARS and not looks_incomplete(text)
 
 
-def trim_overlap(base_text: str, new_text: str, max_overlap: int = 80) -> str:
-    if not base_text or not new_text:
-        return new_text
+def normalize_tarot_output(raw_text: str) -> str:
+    card_name, meaning = parse_card_and_meaning(raw_text)
+    if not meaning:
+        meaning = strip_card_header(raw_text)
+    if not meaning:
+        meaning = "命运信号暂时模糊，请再次抽牌获取更清晰的指引。"
+    if looks_incomplete(meaning):
+        meaning += "。"
+    return f"CARD: [{card_name}]\n\n{meaning.strip()}"
 
-    overlap_limit = min(max_overlap, len(base_text), len(new_text))
-    for size in range(overlap_limit, 0, -1):
-        if base_text.endswith(new_text[:size]):
-            return new_text[size:]
-    return new_text
 
-
-def request_continuation(
-    client: OpenAI, question: str, card_name: str, current_meaning: str
-) -> str:
-    continuation_user_prompt = (
-        f"用户问题：{question}\n"
-        f"卡牌：{card_name}\n"
-        f"当前已生成内容（可能被截断）：\n{current_meaning}\n\n"
-        "请从最后一句自然续写，不要重复已有内容。"
-    )
-
+def request_model_text(client: OpenAI, messages: list[dict[str, str]]) -> str:
     response = client.chat.completions.create(
         model=ALIYUN_MODEL,
-        max_tokens=1200,
         stream=False,
-        messages=[
-            {"role": "system", "content": CONTINUATION_SYSTEM_PROMPT},
-            {"role": "user", "content": continuation_user_prompt},
-        ],
+        max_tokens=GENERATION_MAX_TOKENS,
+        messages=messages,
     )
     if not response.choices:
         return ""
+    return extract_text(response.choices[0].message.content).replace("\uFEFF", "").strip()
 
-    message = response.choices[0].message
-    raw_text = extract_text(message.content).replace("\uFEFF", "").strip()
-    if not raw_text:
-        return ""
 
-    return strip_card_header(raw_text)
+def build_complete_tarot_text(client: OpenAI, question: str) -> str:
+    best_raw = ""
+    best_score = -1
+    candidate_raw = request_model_text(
+        client,
+        [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ],
+    )
+
+    for attempt in range(MAX_GENERATION_ATTEMPTS):
+        if attempt > 0:
+            repair_user_prompt = (
+                f"用户问题：{question}\n"
+                f"当前草稿：\n{candidate_raw or best_raw}\n\n"
+                "请修复为完整且连贯的最终版。"
+            )
+            candidate_raw = request_model_text(
+                client,
+                [
+                    {"role": "system", "content": REPAIR_SYSTEM_PROMPT},
+                    {"role": "user", "content": repair_user_prompt},
+                ],
+            )
+
+        if not candidate_raw:
+            continue
+
+        card_name, meaning = parse_card_and_meaning(candidate_raw)
+        score = meaning_char_count(meaning)
+        if is_meaning_complete(meaning):
+            return normalize_tarot_output(candidate_raw)
+
+        if score > best_score:
+            best_score = score
+            best_raw = f"CARD: [{card_name}]\n\n{meaning}".strip()
+
+    fallback = normalize_tarot_output(best_raw or candidate_raw or "CARD: [未知卡牌]\n\n命运信号暂时模糊。")
+    fallback_card, fallback_meaning = parse_card_and_meaning(fallback)
+    if meaning_char_count(fallback_meaning) < MIN_MEANING_CHARS:
+        fallback_meaning += (
+            "\n\n命运信号尚未完全展开，但核心轨迹已经显现。"
+            "请带着当前结论再次追问，以获得更深层的映射与决策指引。"
+        )
+    if looks_incomplete(fallback_meaning):
+        fallback_meaning += "。"
+    return f"CARD: [{fallback_card}]\n\n{fallback_meaning.strip()}"
+
+
+def iter_text_chunks(text: str):
+    for index in range(0, len(text), STREAM_CHUNK_CHARS):
+        yield text[index : index + STREAM_CHUNK_CHARS]
 
 app = FastAPI(title="AI Tarot Backend")
 
@@ -277,78 +325,8 @@ def draw_card(payload: DrawCardRequest):
 
     try:
         client = OpenAI(api_key=ALIYUN_API_KEY, base_url=ALIYUN_BASE_URL)
-        stream = client.chat.completions.create(
-            model=ALIYUN_MODEL,
-            stream=True,
-            max_tokens=1800,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": question},
-            ],
-        )
+        final_text = build_complete_tarot_text(client, question)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"调用大模型失败: {exc}") from exc
 
-    def iter_stream():
-        merged_chunks: list[str] = []
-        finish_reason: str | None = None
-
-        try:
-            for chunk in stream:
-                if not chunk.choices:
-                    continue
-
-                choice = chunk.choices[0]
-                if choice.finish_reason:
-                    finish_reason = choice.finish_reason
-
-                delta_text = extract_text(choice.delta.content)
-                if not delta_text:
-                    continue
-
-                merged_chunks.append(delta_text)
-                yield delta_text
-
-            final_text = "".join(merged_chunks).replace("\uFEFF", "").strip()
-            if not final_text:
-                return
-
-            card_name, meaning_text = parse_card_and_meaning(final_text)
-            need_continuation = finish_reason == "length" or not is_meaning_complete(
-                meaning_text
-            )
-            continuation_round = 0
-
-            while need_continuation and continuation_round < MAX_CONTINUATION_ROUNDS:
-                try:
-                    extra_text = request_continuation(
-                        client=client,
-                        question=question,
-                        card_name=card_name,
-                        current_meaning=meaning_text,
-                    )
-                except Exception:
-                    break
-
-                extra_text = extra_text.strip()
-                if not extra_text:
-                    break
-
-                delta = trim_overlap(meaning_text, extra_text)
-                if not delta:
-                    break
-
-                meaning_text += delta
-                yield delta
-
-                continuation_round += 1
-                need_continuation = not is_meaning_complete(meaning_text)
-
-            if looks_incomplete(meaning_text):
-                yield "。"
-            elif meaning_char_count(meaning_text) < MIN_MEANING_CHARS:
-                yield "\n\n（命运信号暂告一段，如需更深层解析，可再次抽牌继续接收后续指引。）"
-        except Exception as exc:
-            yield f"\n\n[系统提示] 流式传输中断：{exc}"
-
-    return StreamingResponse(iter_stream(), media_type="text/plain; charset=utf-8")
+    return StreamingResponse(iter_text_chunks(final_text), media_type="text/plain; charset=utf-8")

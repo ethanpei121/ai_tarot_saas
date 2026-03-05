@@ -121,8 +121,37 @@ export default function Page() {
       let quotaModalTriggered = false;
       let meaningAccumulated = "";
       let parsedCardName = "";
+      let inThinkBlock = false;
 
       const processBuffer = () => {
+        /* ---- strip <think>…</think> blocks (handles multi-chunk) ---- */
+        {
+          let cleaned = "";
+          let si = 0;
+          while (si < buffer.length) {
+            if (inThinkBlock) {
+              const ci = buffer.indexOf("</think>", si);
+              if (ci === -1) {
+                buffer = cleaned;
+                return; // still inside think block, wait for more data
+              }
+              si = ci + 8;
+              inThinkBlock = false;
+            } else {
+              const oi = buffer.indexOf("<think>", si);
+              if (oi === -1) {
+                cleaned += buffer.slice(si);
+                break;
+              }
+              cleaned += buffer.slice(si, oi);
+              si = oi + 7;
+              inThinkBlock = true;
+            }
+          }
+          buffer = cleaned;
+          if (inThinkBlock) return;
+        }
+
         if (!quotaModalTriggered && buffer.includes(QUOTA_EXHAUSTED_HINT)) {
           quotaModalTriggered = true;
           setShowPaymentModal(true);
@@ -164,7 +193,13 @@ export default function Page() {
         processBuffer();
       }
 
-      if (!cardParsed && buffer.trim()) {
+      /* ---- final cleanup: strip any residual think tags ---- */
+      buffer = buffer
+        .replace(/<think>[\s\S]*?<\/think>/gi, "")
+        .replace(/<think>[\s\S]*$/gi, "")
+        .trim();
+
+      if (!cardParsed && buffer) {
         setCardName("未知卡牌");
         parsedCardName = "未知卡牌";
         const fallbackMeaning = buffer.replace(/^\uFEFF/, "").trim();
@@ -175,7 +210,8 @@ export default function Page() {
         setMeaning((prev) => prev + buffer);
       }
 
-      if (cardParsed && !meaningAccumulated.trim()) {
+      const trimmedMeaning = meaningAccumulated.replace(/\s/g, "");
+      if (!trimmedMeaning || trimmedMeaning.length < 50) {
         const repairedMeaning = buildClientFallbackMeaning(
           trimmedQuestion,
           parsedCardName || "未知卡牌"

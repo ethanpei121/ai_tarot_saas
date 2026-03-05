@@ -63,8 +63,18 @@ CARD_HEADER_PATTERN = re.compile(
 )
 MIN_MEANING_CHARS = 150
 MAX_GENERATION_ATTEMPTS = 3
-GENERATION_MAX_TOKENS = 2200
+GENERATION_MAX_TOKENS = 4096
 STREAM_CHUNK_CHARS = 18
+
+THINK_TAG_RE = re.compile(r"<\|?think\|?>[\s\S]*?<\|?/think\|?>", flags=re.IGNORECASE)
+UNCLOSED_THINK_RE = re.compile(r"<\|?think\|?>[\s\S]*$", flags=re.IGNORECASE)
+
+
+def strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> blocks (including <|think|> variants and unclosed trailing blocks)."""
+    cleaned = THINK_TAG_RE.sub("", text)
+    cleaned = UNCLOSED_THINK_RE.sub("", cleaned)
+    return cleaned.strip()
 
 
 def extract_text(content: Any) -> str:
@@ -79,9 +89,15 @@ def extract_text(content: Any) -> str:
                 continue
 
             if isinstance(item, dict):
+                if item.get("type") in ("thinking", "reasoning"):
+                    continue
                 text = item.get("text")
                 if isinstance(text, str):
                     segments.append(text)
+                continue
+
+            item_type = getattr(item, "type", None)
+            if item_type in ("thinking", "reasoning"):
                 continue
 
             text = getattr(item, "text", None)
@@ -164,10 +180,12 @@ def request_model_text(client: OpenAI, messages: list[dict[str, str]]) -> str:
         stream=False,
         max_tokens=GENERATION_MAX_TOKENS,
         messages=messages,
+        extra_body={"enable_thinking": False},
     )
     if not response.choices:
         return ""
-    return extract_text(response.choices[0].message.content).replace("\uFEFF", "").strip()
+    raw = extract_text(response.choices[0].message.content)
+    return strip_think_tags(raw).replace("\uFEFF", "").strip()
 
 
 def build_complete_tarot_text(client: OpenAI, question: str) -> str:

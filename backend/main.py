@@ -7,7 +7,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse
 from openai import OpenAI
 from pydantic import BaseModel
 from supabase import Client, create_client
@@ -68,7 +68,6 @@ CARD_HEADER_PATTERN = re.compile(
 MIN_MEANING_CHARS = 150
 MAX_GENERATION_ATTEMPTS = 3
 GENERATION_MAX_TOKENS = 4096
-STREAM_CHUNK_CHARS = 18
 
 # Match all think-tag variants: <think>, </think>, <|think|>, <|/think|>
 THINK_TAG_RE = re.compile(
@@ -270,10 +269,6 @@ def build_complete_tarot_text(client: OpenAI, question: str) -> str:
     return f"CARD: [{fallback_card}]\n\n{fallback_meaning}"
 
 
-def iter_text_chunks(text: str):
-    for index in range(0, len(text), STREAM_CHUNK_CHARS):
-        yield text[index : index + STREAM_CHUNK_CHARS]
-
 app = FastAPI(title="AI Tarot Backend")
 
 app.add_middleware(
@@ -355,11 +350,11 @@ def draw_card(payload: DrawCardRequest):
         raise HTTPException(status_code=502, detail=f"读取额度失败: {exc}") from exc
 
     if quota <= 0:
-        def quota_exhausted_stream():
-            yield "【命运的馈赠已达上限】您的免费占卜额度 (3次) 已用完。星辰需要休息，请期待后续商业版的解锁！"
-
-        return StreamingResponse(
-            quota_exhausted_stream(), media_type="text/plain; charset=utf-8"
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": "【命运的馈赠已达上限】您的免费占卜额度 (3次) 已用完。星辰需要休息，请期待后续商业版的解锁！"
+            },
         )
 
     if not ALIYUN_API_KEY:
@@ -398,4 +393,10 @@ def draw_card(payload: DrawCardRequest):
     final_text = strip_think_tags(final_text)
     logger.info("Final output length=%d, first 300 chars: %s", len(final_text), final_text[:300])
 
-    return StreamingResponse(iter_text_chunks(final_text), media_type="text/plain; charset=utf-8")
+    card_name, meaning = parse_card_and_meaning(final_text)
+    meaning = ensure_non_empty_complete_meaning(question, card_name, meaning)
+
+    return JSONResponse(
+        content={"card_name": card_name, "meaning": meaning},
+        media_type="application/json; charset=utf-8",
+    )

@@ -7,24 +7,12 @@ import {
   useAuth,
 } from "@clerk/nextjs";
 import PaymentModal from "@/components/PaymentModal";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useCallback, useRef, useState } from "react";
 
-type ParsedHeader = {
-  cardName: string;
-  consumed: number;
-};
-
-const QUOTA_EXHAUSTED_HINT = "【命运的馈赠已达上限】";
-
-function buildClientFallbackMeaning(question: string, cardName: string): string {
-  const compactQuestion = question.replace(/\s+/g, " ").trim().slice(0, 60) || "你此刻的困惑";
-  return (
-    `你抽到「${cardName}」。当前命运信号出现了短暂抖动，因此我为你补全核心指引。` +
-    `针对“${compactQuestion}”，请先聚焦你能控制的部分：本周只设一个关键目标，` +
-    "把判断标准写成可验证结果，减少情绪化决策与外界噪声输入。你不需要一次看清全部未来，" +
-    "而是通过连续三次小幅正确行动，让现实逐步向你倾斜。保持节奏与边界感，答案会在行动中显形。"
-  );
-}
+/** Characters revealed per tick in the typewriter animation. */
+const TYPEWRITER_CHARS_PER_TICK = 2;
+/** Interval (ms) between typewriter ticks. */
+const TYPEWRITER_INTERVAL_MS = 30;
 
 function SignedIn({ children }: { children: ReactNode }) {
   return <Show when="signed-in">{children}</Show>;
@@ -32,35 +20,6 @@ function SignedIn({ children }: { children: ReactNode }) {
 
 function SignedOut({ children }: { children: ReactNode }) {
   return <Show when="signed-out">{children}</Show>;
-}
-
-function parseCardHeader(buffer: string): ParsedHeader | null {
-  // Trim leading whitespace/newlines that may remain after think-tag removal
-  const trimmed = buffer.replace(/^[\s\r\n]+/, "");
-  const offset = buffer.length - trimmed.length;
-
-  const strictMatch = trimmed.match(/^CARD[:：][ \t]*\[?([^\]\r\n]+)\]?[ \t]*\r?\n\r?\n/i);
-  if (strictMatch) {
-    return {
-      cardName: strictMatch[1]?.trim() || "未知卡牌",
-      consumed: offset + strictMatch[0].length,
-    };
-  }
-
-  const looseMatch = trimmed.match(/^CARD[:：][ \t]*\[?([^\]\r\n]+)\]?[ \t]*\r?\n/i);
-  if (!looseMatch) {
-    return null;
-  }
-
-  const rest = trimmed.slice(looseMatch[0].length);
-  if (!rest || /^[\r\n]+$/.test(rest)) {
-    return null;
-  }
-
-  return {
-    cardName: looseMatch[1]?.trim() || "未知卡牌",
-    consumed: offset + looseMatch[0].length,
-  };
 }
 
 export default function Page() {
@@ -71,6 +30,34 @@ export default function Page() {
   const [meaning, setMeaning] = useState("");
   const [error, setError] = useState("");
   const [showPaymentModal, setShowPaymentModal] = useState(false);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  /** Stop any running typewriter animation. */
+  const stopTypewriter = useCallback(() => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+  }, []);
+
+  /** Animate `fullText` character-by-character into the meaning state. */
+  const startTypewriter = useCallback(
+    (fullText: string) => {
+      stopTypewriter();
+      let cursor = 0;
+      setMeaning("");
+      timerRef.current = setInterval(() => {
+        cursor += TYPEWRITER_CHARS_PER_TICK;
+        if (cursor >= fullText.length) {
+          setMeaning(fullText);
+          stopTypewriter();
+        } else {
+          setMeaning(fullText.slice(0, cursor));
+        }
+      }, TYPEWRITER_INTERVAL_MS);
+    },
+    [stopTypewriter],
+  );
 
   const handleDrawCard = async () => {
     if (!userId) {
@@ -84,6 +71,7 @@ export default function Page() {
       return;
     }
 
+    stopTypewriter();
     setLoading(true);
     setError("");
     setCardName("");
@@ -91,157 +79,54 @@ export default function Page() {
     setShowPaymentModal(false);
 
     try {
-      const response = await fetch("https://ai-tarot-saas.onrender.com/draw_card", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
+      const response = await fetch(
+        "https://ai-tarot-saas.onrender.com/draw_card",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question: trimmedQuestion,
+            user_id: userId,
+          }),
         },
-        body: JSON.stringify({
-          question: trimmedQuestion,
-          user_id: userId,
-        }),
-      });
+      );
 
+      /* ---------- 403: quota exhausted ---------- */
       if (response.status === 403) {
         setShowPaymentModal(true);
-        const rejectText = (await response.text()).trim();
-        setError(rejectText || "当前额度不足，请完成支付后继续占卜。");
+        let detail = "当前额度不足，请完成支付后继续占卜。";
+        try {
+          const body = await response.json();
+          if (body?.detail) detail = body.detail;
+        } catch {
+          /* response was not JSON – use default */
+        }
+        setError(detail);
         return;
       }
 
       if (!response.ok) {
-        throw new Error(`Request failed: ${response.status}`);
+        let detail = `Request failed: ${response.status}`;
+        try {
+          const body = await response.json();
+          if (body?.detail) detail = body.detail;
+        } catch {
+          /* ignore */
+        }
+        throw new Error(detail);
       }
 
-      if (!response.body) {
-        throw new Error("Streaming not supported in this browser");
-      }
+      /* ---------- 200: JSON { card_name, meaning } ---------- */
+      const data = await response.json();
+      const name: string = data.card_name || "未知卡牌";
+      const text: string = data.meaning || "";
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder("utf-8");
+      setCardName(name);
 
-      let buffer = "";
-      let cardParsed = false;
-      let quotaModalTriggered = false;
-      let meaningAccumulated = "";
-      let parsedCardName = "";
-      let inThinkBlock = false;
-
-      const processBuffer = () => {
-        /* ---- strip <think>…</think> blocks (handles multi-chunk) ---- */
-        {
-          let cleaned = "";
-          let si = 0;
-          while (si < buffer.length) {
-            if (inThinkBlock) {
-              const ci = buffer.indexOf("</think>", si);
-              if (ci === -1) {
-                buffer = cleaned;
-                return; // still inside think block, wait for more data
-              }
-              si = ci + 8;
-              inThinkBlock = false;
-            } else {
-              const oi = buffer.indexOf("<think>", si);
-              if (oi === -1) {
-                cleaned += buffer.slice(si);
-                break;
-              }
-              cleaned += buffer.slice(si, oi);
-              si = oi + 7;
-              inThinkBlock = true;
-            }
-          }
-          buffer = cleaned;
-          if (inThinkBlock) return;
-        }
-
-        if (!quotaModalTriggered && buffer.includes(QUOTA_EXHAUSTED_HINT)) {
-          quotaModalTriggered = true;
-          setShowPaymentModal(true);
-        }
-
-        if (!cardParsed) {
-          const parsedHeader = parseCardHeader(buffer);
-          if (!parsedHeader) {
-            return;
-          }
-
-          setCardName(parsedHeader.cardName);
-          parsedCardName = parsedHeader.cardName;
-          buffer = buffer.slice(parsedHeader.consumed);
-          cardParsed = true;
-        }
-
-        if (cardParsed && buffer) {
-          meaningAccumulated += buffer;
-          setMeaning((prev) => prev + buffer);
-          buffer = "";
-        }
-      };
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (value) {
-          buffer += decoder.decode(value, { stream: !done });
-          processBuffer();
-        }
-        if (done) {
-          break;
-        }
-      }
-
-      const trailing = decoder.decode();
-      if (trailing) {
-        buffer += trailing;
-        processBuffer();
-      }
-
-      /* ---- final cleanup: strip any residual think tags ---- */
-      buffer = buffer
-        .replace(/<\|?think\|?>[\s\S]*?<\|?\/?think\|?>/gi, "")
-        .replace(/<\|?think\|?>[\s\S]*$/gi, "")
-        .replace(/^[\s\r\n]+/, "")
-        .trim();
-
-      // Try parsing CARD header from remaining buffer if not yet parsed
-      if (!cardParsed && buffer) {
-        const lateHeader = parseCardHeader(buffer);
-        if (lateHeader) {
-          setCardName(lateHeader.cardName);
-          parsedCardName = lateHeader.cardName;
-          cardParsed = true;
-          const rest = buffer.slice(lateHeader.consumed).trim();
-          if (rest) {
-            meaningAccumulated += rest;
-            setMeaning((prev) => prev + rest);
-          }
-          buffer = "";
-        } else {
-          // No CARD header found; treat entire buffer as meaning
-          setCardName("未知卡牌");
-          parsedCardName = "未知卡牌";
-          const fallbackMeaning = buffer.replace(/^\uFEFF/, "").trim();
-          if (fallbackMeaning) {
-            meaningAccumulated += fallbackMeaning;
-            setMeaning((prev) => prev + fallbackMeaning);
-          }
-        }
-      } else if (buffer) {
-        meaningAccumulated += buffer;
-        setMeaning((prev) => prev + buffer);
-      }
-
-      // Strip any CARD: line that leaked into meaning text
-      const cleanedMeaning = meaningAccumulated
-        .replace(/^CARD[:：][ \t]*\[?[^\]\r\n]*\]?[ \t]*[\r\n]*/i, "")
-        .replace(/\s/g, "");
-      if (!cleanedMeaning || cleanedMeaning.length < 30) {
-        const repairedMeaning = buildClientFallbackMeaning(
-          trimmedQuestion,
-          parsedCardName || "未知卡牌"
-        );
-        setMeaning(repairedMeaning);
+      if (text) {
+        startTypewriter(text);
+      } else {
+        setMeaning("命运信号解析失败，请稍后重试。");
       }
     } catch {
       setError("星图信号短暂失联，请确认后端已启动后再试。");
@@ -296,7 +181,10 @@ export default function Page() {
           </p>
 
           <div className="mt-8">
-            <label htmlFor="question" className="mb-2 block text-sm text-purple-300">
+            <label
+              htmlFor="question"
+              className="mb-2 block text-sm text-purple-300"
+            >
               你的问题
             </label>
             <textarea

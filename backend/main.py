@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -45,16 +46,28 @@ SYSTEM_PROMPT = (
     "不要输出JSON，不要输出Markdown标题，不要输出额外前缀。"
 )
 
+CONTINUATION_SYSTEM_PROMPT = (
+    "你是同一个塔罗占卜师。你会接收一段已生成但可能被截断的占卜内容。"
+    "请只输出新增的续写内容，不要重复已生成内容，不要重写 CARD 行。"
+    "续写至少100字，并自然完整收尾。"
+)
+
 SENTENCE_ENDINGS = ("。", "！", "？", ".", "!", "?", "”", "」", "』", "）", ")")
+CARD_HEADER_PATTERN = re.compile(
+    r"^\s*CARD[:：]\s*\[?([^\]\r\n]+)\]?\s*\r?\n(?:\r?\n)?",
+    flags=re.IGNORECASE,
+)
+MIN_MEANING_CHARS = 150
+MAX_CONTINUATION_ROUNDS = 2
 
 
-def extract_delta_text(delta_content: Any) -> str:
-    if isinstance(delta_content, str):
-        return delta_content
+def extract_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
 
-    if isinstance(delta_content, list):
+    if isinstance(content, list):
         segments: list[str] = []
-        for item in delta_content:
+        for item in content:
             if isinstance(item, str):
                 segments.append(item)
                 continue
@@ -68,6 +81,11 @@ def extract_delta_text(delta_content: Any) -> str:
             text = getattr(item, "text", None)
             if isinstance(text, str):
                 segments.append(text)
+                continue
+
+            nested = getattr(item, "content", None)
+            if isinstance(nested, str):
+                segments.append(nested)
 
         return "".join(segments)
 
@@ -79,6 +97,70 @@ def looks_incomplete(text: str) -> bool:
     if not cleaned:
         return False
     return not cleaned.endswith(SENTENCE_ENDINGS)
+
+
+def strip_card_header(text: str) -> str:
+    return CARD_HEADER_PATTERN.sub("", text, count=1).strip()
+
+
+def parse_card_and_meaning(full_text: str) -> tuple[str, str]:
+    normalized = full_text.replace("\uFEFF", "").strip()
+    match = CARD_HEADER_PATTERN.match(normalized)
+    if not match:
+        return "未知卡牌", normalized
+
+    card_name = (match.group(1) or "未知卡牌").strip() or "未知卡牌"
+    meaning = normalized[match.end() :].strip()
+    return card_name, meaning
+
+
+def meaning_char_count(text: str) -> int:
+    return len(re.sub(r"\s+", "", text))
+
+
+def is_meaning_complete(text: str) -> bool:
+    return meaning_char_count(text) >= MIN_MEANING_CHARS and not looks_incomplete(text)
+
+
+def trim_overlap(base_text: str, new_text: str, max_overlap: int = 80) -> str:
+    if not base_text or not new_text:
+        return new_text
+
+    overlap_limit = min(max_overlap, len(base_text), len(new_text))
+    for size in range(overlap_limit, 0, -1):
+        if base_text.endswith(new_text[:size]):
+            return new_text[size:]
+    return new_text
+
+
+def request_continuation(
+    client: OpenAI, question: str, card_name: str, current_meaning: str
+) -> str:
+    continuation_user_prompt = (
+        f"用户问题：{question}\n"
+        f"卡牌：{card_name}\n"
+        f"当前已生成内容（可能被截断）：\n{current_meaning}\n\n"
+        "请从最后一句自然续写，不要重复已有内容。"
+    )
+
+    response = client.chat.completions.create(
+        model=ALIYUN_MODEL,
+        max_tokens=1200,
+        stream=False,
+        messages=[
+            {"role": "system", "content": CONTINUATION_SYSTEM_PROMPT},
+            {"role": "user", "content": continuation_user_prompt},
+        ],
+    )
+    if not response.choices:
+        return ""
+
+    message = response.choices[0].message
+    raw_text = extract_text(message.content).replace("\uFEFF", "").strip()
+    if not raw_text:
+        return ""
+
+    return strip_card_header(raw_text)
 
 app = FastAPI(title="AI Tarot Backend")
 
@@ -220,7 +302,7 @@ def draw_card(payload: DrawCardRequest):
                 if choice.finish_reason:
                     finish_reason = choice.finish_reason
 
-                delta_text = extract_delta_text(choice.delta.content)
+                delta_text = extract_text(choice.delta.content)
                 if not delta_text:
                     continue
 
@@ -231,10 +313,41 @@ def draw_card(payload: DrawCardRequest):
             if not final_text:
                 return
 
-            if finish_reason == "length":
-                yield "\n\n（命运信号尚未完全展开：本次回复达到模型输出上限。可再次抽牌继续接收后续指引。）"
-            elif looks_incomplete(final_text):
+            card_name, meaning_text = parse_card_and_meaning(final_text)
+            need_continuation = finish_reason == "length" or not is_meaning_complete(
+                meaning_text
+            )
+            continuation_round = 0
+
+            while need_continuation and continuation_round < MAX_CONTINUATION_ROUNDS:
+                try:
+                    extra_text = request_continuation(
+                        client=client,
+                        question=question,
+                        card_name=card_name,
+                        current_meaning=meaning_text,
+                    )
+                except Exception:
+                    break
+
+                extra_text = extra_text.strip()
+                if not extra_text:
+                    break
+
+                delta = trim_overlap(meaning_text, extra_text)
+                if not delta:
+                    break
+
+                meaning_text += delta
+                yield delta
+
+                continuation_round += 1
+                need_continuation = not is_meaning_complete(meaning_text)
+
+            if looks_incomplete(meaning_text):
                 yield "。"
+            elif meaning_char_count(meaning_text) < MIN_MEANING_CHARS:
+                yield "\n\n（命运信号暂告一段，如需更深层解析，可再次抽牌继续接收后续指引。）"
         except Exception as exc:
             yield f"\n\n[系统提示] 流式传输中断：{exc}"
 

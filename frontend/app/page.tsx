@@ -35,27 +35,31 @@ function SignedOut({ children }: { children: ReactNode }) {
 }
 
 function parseCardHeader(buffer: string): ParsedHeader | null {
-  const strictMatch = buffer.match(/^CARD[:：][ \t]*\[?([^\]\r\n]+)\]?[ \t]*\r?\n\r?\n/i);
+  // Trim leading whitespace/newlines that may remain after think-tag removal
+  const trimmed = buffer.replace(/^[\s\r\n]+/, "");
+  const offset = buffer.length - trimmed.length;
+
+  const strictMatch = trimmed.match(/^CARD[:：][ \t]*\[?([^\]\r\n]+)\]?[ \t]*\r?\n\r?\n/i);
   if (strictMatch) {
     return {
       cardName: strictMatch[1]?.trim() || "未知卡牌",
-      consumed: strictMatch[0].length,
+      consumed: offset + strictMatch[0].length,
     };
   }
 
-  const looseMatch = buffer.match(/^CARD[:：][ \t]*\[?([^\]\r\n]+)\]?[ \t]*\r?\n/i);
+  const looseMatch = trimmed.match(/^CARD[:：][ \t]*\[?([^\]\r\n]+)\]?[ \t]*\r?\n/i);
   if (!looseMatch) {
     return null;
   }
 
-  const rest = buffer.slice(looseMatch[0].length);
+  const rest = trimmed.slice(looseMatch[0].length);
   if (!rest || /^[\r\n]+$/.test(rest)) {
     return null;
   }
 
   return {
     cardName: looseMatch[1]?.trim() || "未知卡牌",
-    consumed: looseMatch[0].length,
+    consumed: offset + looseMatch[0].length,
   };
 }
 
@@ -195,23 +199,44 @@ export default function Page() {
 
       /* ---- final cleanup: strip any residual think tags ---- */
       buffer = buffer
-        .replace(/<think>[\s\S]*?<\/think>/gi, "")
-        .replace(/<think>[\s\S]*$/gi, "")
+        .replace(/<\|?think\|?>[\s\S]*?<\|?\/?think\|?>/gi, "")
+        .replace(/<\|?think\|?>[\s\S]*$/gi, "")
+        .replace(/^[\s\r\n]+/, "")
         .trim();
 
+      // Try parsing CARD header from remaining buffer if not yet parsed
       if (!cardParsed && buffer) {
-        setCardName("未知卡牌");
-        parsedCardName = "未知卡牌";
-        const fallbackMeaning = buffer.replace(/^\uFEFF/, "").trim();
-        meaningAccumulated += fallbackMeaning;
-        setMeaning((prev) => prev + fallbackMeaning);
+        const lateHeader = parseCardHeader(buffer);
+        if (lateHeader) {
+          setCardName(lateHeader.cardName);
+          parsedCardName = lateHeader.cardName;
+          cardParsed = true;
+          const rest = buffer.slice(lateHeader.consumed).trim();
+          if (rest) {
+            meaningAccumulated += rest;
+            setMeaning((prev) => prev + rest);
+          }
+          buffer = "";
+        } else {
+          // No CARD header found; treat entire buffer as meaning
+          setCardName("未知卡牌");
+          parsedCardName = "未知卡牌";
+          const fallbackMeaning = buffer.replace(/^\uFEFF/, "").trim();
+          if (fallbackMeaning) {
+            meaningAccumulated += fallbackMeaning;
+            setMeaning((prev) => prev + fallbackMeaning);
+          }
+        }
       } else if (buffer) {
         meaningAccumulated += buffer;
         setMeaning((prev) => prev + buffer);
       }
 
-      const trimmedMeaning = meaningAccumulated.replace(/\s/g, "");
-      if (!trimmedMeaning || trimmedMeaning.length < 50) {
+      // Strip any CARD: line that leaked into meaning text
+      const cleanedMeaning = meaningAccumulated
+        .replace(/^CARD[:：][ \t]*\[?[^\]\r\n]*\]?[ \t]*[\r\n]*/i, "")
+        .replace(/\s/g, "");
+      if (!cleanedMeaning || cleanedMeaning.length < 30) {
         const repairedMeaning = buildClientFallbackMeaning(
           trimmedQuestion,
           parsedCardName || "未知卡牌"

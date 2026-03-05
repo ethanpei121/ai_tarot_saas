@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 from pathlib import Path
@@ -10,6 +11,9 @@ from fastapi.responses import StreamingResponse
 from openai import OpenAI
 from pydantic import BaseModel
 from supabase import Client, create_client
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("tarot")
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -66,12 +70,19 @@ MAX_GENERATION_ATTEMPTS = 3
 GENERATION_MAX_TOKENS = 4096
 STREAM_CHUNK_CHARS = 18
 
-THINK_TAG_RE = re.compile(r"<\|?think\|?>[\s\S]*?<\|?/think\|?>", flags=re.IGNORECASE)
-UNCLOSED_THINK_RE = re.compile(r"<\|?think\|?>[\s\S]*$", flags=re.IGNORECASE)
+# Match all think-tag variants: <think>, </think>, <|think|>, <|/think|>
+THINK_TAG_RE = re.compile(
+    r"<\|?think\|?>[\s\S]*?<\|?/?think\|?>",
+    flags=re.IGNORECASE,
+)
+UNCLOSED_THINK_RE = re.compile(
+    r"<\|?think\|?>[\s\S]*$",
+    flags=re.IGNORECASE,
+)
 
 
 def strip_think_tags(text: str) -> str:
-    """Remove <think>...</think> blocks (including <|think|> variants and unclosed trailing blocks)."""
+    """Remove all <think>…</think> blocks, including unclosed trailing blocks."""
     cleaned = THINK_TAG_RE.sub("", text)
     cleaned = UNCLOSED_THINK_RE.sub("", cleaned)
     return cleaned.strip()
@@ -174,18 +185,45 @@ def normalize_tarot_output(raw_text: str, question: str) -> str:
     return f"CARD: [{card_name}]\n\n{meaning}"
 
 
+def _append_no_think(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Append /no_think to the last user message so Qwen3 skips internal reasoning."""
+    out = [m.copy() for m in messages]
+    for m in reversed(out):
+        if m.get("role") == "user":
+            text = m["content"] or ""
+            if "/no_think" not in text:
+                m["content"] = text.rstrip() + "\n/no_think"
+            break
+    return out
+
+
 def request_model_text(client: OpenAI, messages: list[dict[str, str]]) -> str:
-    response = client.chat.completions.create(
-        model=ALIYUN_MODEL,
-        stream=False,
-        max_tokens=GENERATION_MAX_TOKENS,
-        messages=messages,
-        extra_body={"enable_thinking": False},
-    )
+    patched = _append_no_think(messages)
+    try:
+        response = client.chat.completions.create(
+            model=ALIYUN_MODEL,
+            stream=False,
+            max_tokens=GENERATION_MAX_TOKENS,
+            messages=patched,
+            extra_body={"enable_thinking": False},
+        )
+    except Exception:
+        # Fallback: retry without extra_body in case API rejects unknown param
+        logger.warning("Retrying without extra_body (enable_thinking may not be supported)")
+        response = client.chat.completions.create(
+            model=ALIYUN_MODEL,
+            stream=False,
+            max_tokens=GENERATION_MAX_TOKENS,
+            messages=patched,
+        )
     if not response.choices:
+        logger.warning("Model returned no choices")
         return ""
     raw = extract_text(response.choices[0].message.content)
-    return strip_think_tags(raw).replace("\uFEFF", "").strip()
+    cleaned = strip_think_tags(raw).replace("\uFEFF", "").strip()
+    logger.info("Model raw length=%d, cleaned length=%d, first 200 chars: %s",
+                len(raw), len(cleaned), cleaned[:200])
+    return cleaned
 
 
 def build_complete_tarot_text(client: OpenAI, question: str) -> str:
@@ -353,6 +391,11 @@ def draw_card(payload: DrawCardRequest):
         client = OpenAI(api_key=ALIYUN_API_KEY, base_url=ALIYUN_BASE_URL)
         final_text = build_complete_tarot_text(client, question)
     except Exception as exc:
+        logger.error("Model call failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=502, detail=f"调用大模型失败: {exc}") from exc
+
+    # Final safety: strip any residual think tags from the outbound text
+    final_text = strip_think_tags(final_text)
+    logger.info("Final output length=%d, first 300 chars: %s", len(final_text), final_text[:300])
 
     return StreamingResponse(iter_text_chunks(final_text), media_type="text/plain; charset=utf-8")

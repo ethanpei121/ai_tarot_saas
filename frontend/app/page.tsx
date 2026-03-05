@@ -16,6 +16,16 @@ type ParsedHeader = {
 
 const QUOTA_EXHAUSTED_HINT = "【命运的馈赠已达上限】";
 
+function buildClientFallbackMeaning(question: string, cardName: string): string {
+  const compactQuestion = question.replace(/\s+/g, " ").trim().slice(0, 60) || "你此刻的困惑";
+  return (
+    `你抽到「${cardName}」。当前命运信号出现了短暂抖动，因此我为你补全核心指引。` +
+    `针对“${compactQuestion}”，请先聚焦你能控制的部分：本周只设一个关键目标，` +
+    "把判断标准写成可验证结果，减少情绪化决策与外界噪声输入。你不需要一次看清全部未来，" +
+    "而是通过连续三次小幅正确行动，让现实逐步向你倾斜。保持节奏与边界感，答案会在行动中显形。"
+  );
+}
+
 function SignedIn({ children }: { children: ReactNode }) {
   return <Show when="signed-in">{children}</Show>;
 }
@@ -25,7 +35,7 @@ function SignedOut({ children }: { children: ReactNode }) {
 }
 
 function parseCardHeader(buffer: string): ParsedHeader | null {
-  const strictMatch = buffer.match(/^CARD[:：]\s*\[?([^\]\r\n]+)\]?\s*\r?\n\r?\n/i);
+  const strictMatch = buffer.match(/^CARD[:：][ \t]*\[?([^\]\r\n]+)\]?[ \t]*\r?\n\r?\n/i);
   if (strictMatch) {
     return {
       cardName: strictMatch[1]?.trim() || "未知卡牌",
@@ -33,7 +43,7 @@ function parseCardHeader(buffer: string): ParsedHeader | null {
     };
   }
 
-  const looseMatch = buffer.match(/^CARD[:：]\s*\[?([^\]\r\n]+)\]?\s*\r?\n/i);
+  const looseMatch = buffer.match(/^CARD[:：][ \t]*\[?([^\]\r\n]+)\]?[ \t]*\r?\n/i);
   if (!looseMatch) {
     return null;
   }
@@ -109,6 +119,8 @@ export default function Page() {
       let buffer = "";
       let cardParsed = false;
       let quotaModalTriggered = false;
+      let meaningAccumulated = "";
+      let parsedCardName = "";
 
       const processBuffer = () => {
         if (!quotaModalTriggered && buffer.includes(QUOTA_EXHAUSTED_HINT)) {
@@ -123,11 +135,13 @@ export default function Page() {
           }
 
           setCardName(parsedHeader.cardName);
+          parsedCardName = parsedHeader.cardName;
           buffer = buffer.slice(parsedHeader.consumed);
           cardParsed = true;
         }
 
         if (cardParsed && buffer) {
+          meaningAccumulated += buffer;
           setMeaning((prev) => prev + buffer);
           buffer = "";
         }
@@ -152,9 +166,21 @@ export default function Page() {
 
       if (!cardParsed && buffer.trim()) {
         setCardName("未知卡牌");
-        setMeaning((prev) => prev + buffer.replace(/^\uFEFF/, "").trim());
+        parsedCardName = "未知卡牌";
+        const fallbackMeaning = buffer.replace(/^\uFEFF/, "").trim();
+        meaningAccumulated += fallbackMeaning;
+        setMeaning((prev) => prev + fallbackMeaning);
       } else if (buffer) {
+        meaningAccumulated += buffer;
         setMeaning((prev) => prev + buffer);
+      }
+
+      if (cardParsed && !meaningAccumulated.trim()) {
+        const repairedMeaning = buildClientFallbackMeaning(
+          trimmedQuestion,
+          parsedCardName || "未知卡牌"
+        );
+        setMeaning(repairedMeaning);
       }
     } catch {
       setError("星图信号短暂失联，请确认后端已启动后再试。");

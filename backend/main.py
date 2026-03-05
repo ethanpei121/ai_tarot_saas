@@ -46,11 +46,6 @@ SYSTEM_PROMPT = (
     "不要输出JSON，不要输出Markdown标题，不要输出额外前缀。"
 )
 
-CONTINUATION_SYSTEM_PROMPT = (
-    "你是同一个塔罗占卜师。你会接收一段已生成但可能被截断的占卜内容。"
-    "请只输出新增的续写内容，不要重复已生成内容，不要重写 CARD 行。"
-    "续写至少100字，并自然完整收尾。"
-)
 REPAIR_SYSTEM_PROMPT = (
     "你是一个严谨的塔罗编辑器。你会收到一段可能不完整、语义断裂或格式错误的占卜草稿。"
     "请将其修复为完整、连贯、自然收尾的最终版本。"
@@ -63,7 +58,7 @@ REPAIR_SYSTEM_PROMPT = (
 
 SENTENCE_ENDINGS = ("。", "！", "？", ".", "!", "?", "”", "」", "』", "）", ")")
 CARD_HEADER_PATTERN = re.compile(
-    r"^\s*CARD[:：]\s*\[?([^\]\r\n]+)\]?\s*\r?\n(?:\r?\n)?",
+    r"^\s*CARD[:：][ \t]*\[?([^\]\r\n]+)\]?[ \t]*\r?\n(?:\r?\n)?",
     flags=re.IGNORECASE,
 )
 MIN_MEANING_CHARS = 150
@@ -133,15 +128,34 @@ def is_meaning_complete(text: str) -> bool:
     return meaning_char_count(text) >= MIN_MEANING_CHARS and not looks_incomplete(text)
 
 
-def normalize_tarot_output(raw_text: str) -> str:
+def build_forced_fallback_meaning(question: str, card_name: str) -> str:
+    compact_question = re.sub(r"\s+", " ", question).strip()
+    compact_question = compact_question[:60] if compact_question else "你此刻的困惑"
+    return (
+        f"你抽到「{card_name}」，命运并未沉默，而是在高噪声中给你一条可执行的路径。"
+        f"针对“{compact_question}”，先停止追逐外界即时反馈，把注意力拉回你真正可控的三件事："
+        "一是明确本周必须完成的最小目标，二是砍掉一切分散精力的伪任务，三是把关键决策写成可验证的条件。"
+        "当你不再被情绪和幻象牵引，牌面会从不确定中显露秩序。接下来七天，请用行动而非猜测验证方向，"
+        "你会看到局势开始向你倾斜。"
+    )
+
+
+def ensure_non_empty_complete_meaning(question: str, card_name: str, meaning: str) -> str:
+    normalized = meaning.strip()
+    if meaning_char_count(normalized) < MIN_MEANING_CHARS:
+        fallback = build_forced_fallback_meaning(question, card_name)
+        normalized = f"{normalized}\n\n{fallback}".strip() if normalized else fallback
+    if looks_incomplete(normalized):
+        normalized += "。"
+    return normalized
+
+
+def normalize_tarot_output(raw_text: str, question: str) -> str:
     card_name, meaning = parse_card_and_meaning(raw_text)
     if not meaning:
         meaning = strip_card_header(raw_text)
-    if not meaning:
-        meaning = "命运信号暂时模糊，请再次抽牌获取更清晰的指引。"
-    if looks_incomplete(meaning):
-        meaning += "。"
-    return f"CARD: [{card_name}]\n\n{meaning.strip()}"
+    meaning = ensure_non_empty_complete_meaning(question, card_name, meaning)
+    return f"CARD: [{card_name}]\n\n{meaning}"
 
 
 def request_model_text(client: OpenAI, messages: list[dict[str, str]]) -> str:
@@ -188,22 +202,16 @@ def build_complete_tarot_text(client: OpenAI, question: str) -> str:
         card_name, meaning = parse_card_and_meaning(candidate_raw)
         score = meaning_char_count(meaning)
         if is_meaning_complete(meaning):
-            return normalize_tarot_output(candidate_raw)
+            return normalize_tarot_output(candidate_raw, question)
 
         if score > best_score:
             best_score = score
-            best_raw = f"CARD: [{card_name}]\n\n{meaning}".strip()
+            best_raw = f"CARD: [{card_name}]\n\n{meaning}" if meaning else f"CARD: [{card_name}]\n\n"
 
-    fallback = normalize_tarot_output(best_raw or candidate_raw or "CARD: [未知卡牌]\n\n命运信号暂时模糊。")
+    fallback = normalize_tarot_output(best_raw or candidate_raw or "CARD: [未知卡牌]\n\n", question)
     fallback_card, fallback_meaning = parse_card_and_meaning(fallback)
-    if meaning_char_count(fallback_meaning) < MIN_MEANING_CHARS:
-        fallback_meaning += (
-            "\n\n命运信号尚未完全展开，但核心轨迹已经显现。"
-            "请带着当前结论再次追问，以获得更深层的映射与决策指引。"
-        )
-    if looks_incomplete(fallback_meaning):
-        fallback_meaning += "。"
-    return f"CARD: [{fallback_card}]\n\n{fallback_meaning.strip()}"
+    fallback_meaning = ensure_non_empty_complete_meaning(question, fallback_card, fallback_meaning)
+    return f"CARD: [{fallback_card}]\n\n{fallback_meaning}"
 
 
 def iter_text_chunks(text: str):
